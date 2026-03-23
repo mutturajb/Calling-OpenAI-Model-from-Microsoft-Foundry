@@ -1,67 +1,72 @@
-Azure OpenAI / Microsoft Foundry — sample chat app
-==================================================
+Microsoft Foundry — sample chat app (Azure AI Projects + Entra ID only)
+========================================================================
 
-This folder contains a small Streamlit app (`app.py`) that calls your Azure OpenAI
-deployment using credentials from a `.env` file.
+This app uses the **Azure AI Projects** Python SDK (`AIProjectClient`) and
+**Microsoft Entra ID** for sign-in (`az login`). There are **no API keys** in `.env`.
+
+What `.env` contains (configuration only — *where* to call, *which* deployment):
+  - AZURE_AI_PROJECT_ENDPOINT — project URL from the Foundry portal
+  - AZURE_AI_MODEL_DEPLOYMENT_NAME — name from Models → Deployments
+
+What `az login` provides (identity):
+  - `DefaultAzureCredential()` picks up your CLI session and obtains tokens.
+  - `AIProjectClient` / `get_openai_client()` use those tokens (not a key from a file).
+
+Flow in code:
+  1) AIProjectClient(endpoint, credential)
+  2) get_openai_client() → openai.OpenAI at …/openai/v1
+  3) chat.completions.create(model=deployment_name, messages=…)
 
 
 Prerequisites
 -------------
-- Python 3.10 or newer installed
-- An Azure OpenAI or Microsoft Foundry deployment, plus endpoint URL, API key,
-  and deployment name
+- Python 3.10+
+- A Microsoft Foundry project with a model deployed
+- Azure CLI for `az login`
 
 
-Setup (first time only)
-------------------------
-Open a terminal in this project folder, then run:
+Install Azure CLI
+-----------------
+Official guide: https://learn.microsoft.com/cli/azure/install-azure-cli
 
-1) Create a virtual environment (recommended):
+Quick options:
+- Linux (Ubuntu/Debian):  curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+- Windows:                winget install -e --id Microsoft.AzureCLI
+- macOS:                  brew install azure-cli
 
+Verify:
+   az version
+   az login
+
+
+Next steps
+----------
+1) az login
+2) Copy the **project endpoint** from Azure Portal / Foundry (often …/api/projects/…)
+3) Copy the **deployment name** from Foundry → Build → Models → Deployments
+4) Ensure your account has a role on the project (e.g. Azure AI User) — IAM in portal.
+   https://learn.microsoft.com/azure/ai-foundry/concepts/rbac-foundry
+5) Copy `.env.example` to `.env` and set the two variables (no keys).
+
+
+Setup (Python)
+--------------
    python3 -m venv .venv
-
-2) Activate the virtual environment:
-
-   On Linux or macOS:
    source .venv/bin/activate
-
-   On Windows (Command Prompt):
-   .venv\Scripts\activate.bat
-
-   On Windows (PowerShell):
-   .venv\Scripts\Activate.ps1
-
-3) Install dependencies:
-
    pip install -r requirements.txt
 
-4) Configure secrets:
 
-   Copy `.env.example` to `.env` and edit `.env` with your real values:
-
-   - AZURE_OPENAI_ENDPOINT — resource URL (for Foundry, use the host like
-     https://your-resource.services.ai.azure.com if unsure)
-   - AZURE_OPENAI_API_KEY — key from Azure Portal or Foundry
-   - AZURE_OPENAI_DEPLOYMENT_NAME — name of your model deployment (example: DeepSeek-V3.2)
-
-
-Run the app
------------
-With the virtual environment activated and dependencies installed:
-
+Run
+---
    streamlit run app.py
 
-Your browser should open to the local Streamlit URL (often http://localhost:8501).
-Type messages in the chat box at the bottom to talk to your deployment.
+Stop with Ctrl+C in the terminal.
 
 
-Stop the app
-------------
-In the terminal where Streamlit is running, press Ctrl+C.
+Troubleshooting
+---------------
+- Auth errors: run `az login`, `az account set --subscription <id>` if needed, check IAM.
+- Wrong deployment: `AZURE_AI_MODEL_DEPLOYMENT_NAME` must match Foundry exactly.
 
-
-Notes
------
-- Do not commit your real `.env` file or API keys to source control.
-- If you see API errors, check that the endpoint, key, and deployment name match
-  what Azure / Foundry shows for your project.
+Remove old variables from your `.env` if you still have AZURE_OPENAI_* or
+AZURE_INFERENCE_* — this sample no longer reads them.

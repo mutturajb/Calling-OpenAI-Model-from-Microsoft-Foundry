@@ -1,13 +1,24 @@
 """
-Azure OpenAI chat (Microsoft Foundry) — learning example.
+Microsoft Foundry chat — Azure AI Projects client + Microsoft Entra ID
 
-Run in a terminal:
+Run:
     streamlit run app.py
 
-What this file does (in order):
-    1. Read secrets from a .env file
-    2. Build an Azure OpenAI client
-    3. Show a chat page; send with the Send button; Clear resets history
+Before running:
+    az login
+
+Configuration (`.env` — only *where* to call and *which* deployment; no API keys):
+    AZURE_AI_PROJECT_ENDPOINT   — your Foundry project URL from the portal
+    AZURE_AI_MODEL_DEPLOYMENT_NAME — model deployment name in Foundry
+
+How auth works (no secrets in `.env`):
+    DefaultAzureCredential() uses your `az login` session (or other Azure dev
+    credentials). AIProjectClient exchanges that for tokens to call Azure AI.
+
+How the SDK fits together:
+    1) AIProjectClient(endpoint, credential)  — Foundry *project* entry point
+    2) get_openai_client()  — returns openai.OpenAI wired to …/openai/v1 + bearer token
+    3) chat.completions.create(model=deployment, messages=…)  — chat with your deployment
 """
 
 # -----------------------------------------------------------------------------
@@ -15,90 +26,52 @@ What this file does (in order):
 # -----------------------------------------------------------------------------
 
 import os
-from urllib.parse import urlparse
 
 import streamlit as st
+from azure.ai.projects import AIProjectClient
+from azure.core.exceptions import ClientAuthenticationError
+from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
-from openai import AzureOpenAI, OpenAIError
-
+from openai import OpenAIError
 
 # -----------------------------------------------------------------------------
-# 2. Constants (defaults you can change)
+# 2. Constants
 # -----------------------------------------------------------------------------
 
-DEFAULT_API_VERSION = "2024-10-21"
 DEFAULT_DEPLOYMENT_NAME = "DeepSeek-V3.2"
 SYSTEM_PROMPT = "You are a helpful assistant."
 
 
 # -----------------------------------------------------------------------------
-# 3. Helper functions
+# 3. Settings (only endpoint + deployment — identity comes from `az login`)
 # -----------------------------------------------------------------------------
 
 
-def fix_foundry_endpoint(url: str) -> str:
-    """
-    Sometimes the Azure portal shows a long “project” URL like:
-        https://xxx.services.ai.azure.com/api/projects/my-project
-
-    The Python SDK expects the shorter resource URL:
-        https://xxx.services.ai.azure.com
-    """
-    url = url.strip().rstrip("/")
-    if not url:
-        return url
-
-    parts = urlparse(url)
-    host = (parts.hostname or "").lower()
-    path = parts.path or ""
-
-    if "services.ai.azure.com" in host and "/api/projects" in path:
-        return f"{parts.scheme}://{parts.netloc}"
-
-    return url
-
-
-def read_env_settings():
-    """Load variables from .env into a dictionary."""
+def read_settings() -> dict:
+    """Load `.env`. API keys are not used; sign in with `az login` instead."""
     load_dotenv()
 
-    raw_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
-    if not raw_endpoint:
-        raw_endpoint = os.getenv("AZURE_INFERENCE_ENDPOINT", "").strip()
-
-    endpoint_url = fix_foundry_endpoint(raw_endpoint)
-    api_key = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
-
-    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "").strip()
+    project_endpoint = os.getenv("AZURE_AI_PROJECT_ENDPOINT", "").strip()
+    deployment = os.getenv("AZURE_AI_MODEL_DEPLOYMENT_NAME", "").strip()
     if not deployment:
         deployment = DEFAULT_DEPLOYMENT_NAME
 
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", DEFAULT_API_VERSION).strip()
-    if not api_version:
-        api_version = DEFAULT_API_VERSION
-
     return {
-        "endpoint_url": endpoint_url,
-        "api_key": api_key,
-        "deployment": deployment,
-        "api_version": api_version,
+        "project_endpoint": project_endpoint,
+        "deployment_name": deployment,
     }
 
 
-def check_required_settings(settings: dict) -> list:
-    """Return a list of missing setting names (empty = OK)."""
-    missing = []
-    if not settings["endpoint_url"]:
-        missing.append("AZURE_OPENAI_ENDPOINT (or AZURE_INFERENCE_ENDPOINT)")
-    if not settings["api_key"]:
-        missing.append("AZURE_OPENAI_API_KEY")
-    return missing
+def missing_settings(settings: dict) -> list[str]:
+    """Only the project URL is required; deployment defaults in code if unset."""
+    if not settings["project_endpoint"]:
+        return ["AZURE_AI_PROJECT_ENDPOINT"]
+    return []
 
 
-def openai_error_text(error: OpenAIError) -> str:
-    """Turn an OpenAI / HTTP error into a string we can show on screen."""
-    text = str(error)
-    response = getattr(error, "response", None)
+def api_error_text(exc: BaseException) -> str:
+    text = str(exc)
+    response = getattr(exc, "response", None)
     if response is not None:
         try:
             body = response.text or ""
@@ -109,8 +82,35 @@ def openai_error_text(error: OpenAIError) -> str:
     return text
 
 
+# -----------------------------------------------------------------------------
+# 4. Azure AI Projects client → OpenAI SDK (cached for Streamlit reruns)
+# -----------------------------------------------------------------------------
+
+
+@st.cache_resource
+def openai_client_from_project(project_endpoint: str):
+    """
+    Privileged Foundry flow (Entra ID only):
+
+    - AIProjectClient: official Azure AI *Projects* SDK for your workspace.
+    - get_openai_client(): hands you openai.OpenAI with the right base URL and
+      token provider (scope https://ai.azure.com/.default — handled inside SDK).
+
+    Requires: `az login` (or another credential DefaultAzureCredential understands).
+    """
+    credential = DefaultAzureCredential(exclude_interactive_browser_credential=False)
+    # Keep AIProjectClient alive for the lifetime of the cached OpenAI client (do not
+    # use a `with` block here — closing the project can invalidate the returned client).
+    project_client = AIProjectClient(endpoint=project_endpoint, credential=credential)
+    return project_client.get_openai_client()
+
+
+# -----------------------------------------------------------------------------
+# 5. UI
+# -----------------------------------------------------------------------------
+
+
 def inject_app_styles() -> None:
-    """Light theme: fonts and spacing (Streamlit theme in .streamlit/config.toml)."""
     st.markdown(
         """
 <style>
@@ -182,12 +182,11 @@ footer { visibility: hidden; height: 0; }
 
 
 def render_page_header() -> None:
-    """Title and subtitle shown at the top of the main area."""
     st.markdown(
         """
 <div class="pro-title-wrap">
   <p class="pro-title">Foundry Chat</p>
-  <p class="pro-subtitle">Azure OpenAI · Microsoft Foundry</p>
+  <p class="pro-subtitle">Azure AI Projects · Entra ID (`az login`) · no API key in .env</p>
 </div>
         """,
         unsafe_allow_html=True,
@@ -195,58 +194,74 @@ def render_page_header() -> None:
 
 
 # -----------------------------------------------------------------------------
-# 4. Main program
+# 6. Main
 # -----------------------------------------------------------------------------
 
 
-def main():
+def main() -> None:
     st.set_page_config(
         page_title="Foundry Chat",
         page_icon="💬",
         layout="wide",
         initial_sidebar_state="expanded",
     )
+
+    settings = read_settings()
     inject_app_styles()
     render_page_header()
 
-    settings = read_env_settings()
-    missing = check_required_settings(settings)
-
+    missing = missing_settings(settings)
     if missing:
         st.error(
-            "Missing values in `.env`. Copy `.env.example` to `.env` and set: "
-            + ", ".join(missing)
+            "Set these in `.env` (see `.env.example`): " + ", ".join(missing)
         )
         st.stop()
 
-    client = AzureOpenAI(
-        azure_endpoint=settings["endpoint_url"],
-        api_key=settings["api_key"],
-        api_version=settings["api_version"],
-    )
-    deployment_name = settings["deployment"]
-
-    # Sidebar: session controls and deployment info
     with st.sidebar:
+        st.markdown("### Sign-in (required)")
+        st.markdown(
+            """
+This app uses **only** Microsoft Entra ID via the Azure SDK:
+
+1. Run **`az login`** in a terminal (`readme.txt` has CLI install steps).
+2. Your account needs a role on the Foundry project (e.g. **Azure AI User**).
+3. **No API key** in `.env` — tokens come from your login.
+
+`.env` only stores **which project** and **which deployment** to call.
+            """
+        )
+        st.divider()
         st.markdown("### Session")
-        st.caption("Clear removes all messages in this browser session.")
         if st.button("Clear conversation", type="primary", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
 
         st.divider()
-        st.markdown("**Active deployment**")
-        st.code(deployment_name, language=None)
+        st.markdown("**Project endpoint** (preview)")
+        _ep = settings["project_endpoint"]
+        st.caption(_ep if len(_ep) <= 72 else _ep[:69] + "…")
+        st.markdown("**Deployment**")
+        st.code(settings["deployment_name"], language=None)
+
+    try:
+        client = openai_client_from_project(settings["project_endpoint"])
+    except ClientAuthenticationError as e:
+        st.error(
+            "Sign-in failed. Run `az login` and check IAM on the project.\n\n"
+            + api_error_text(e)
+        )
+        st.stop()
+    except Exception as e:
+        st.error("Could not create the client:\n\n" + api_error_text(e))
+        st.stop()
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Past messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Input: text area + Send (form clears the box after submit)
     with st.form("message_form", clear_on_submit=True):
         st.markdown("**Your message**")
         user_text = st.text_area(
@@ -264,18 +279,21 @@ def main():
         messages_for_api = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages_for_api.extend(st.session_state.messages)
 
-        with st.spinner("Waiting for the model…"):
+        with st.spinner("Calling your deployment…"):
             try:
                 response = client.chat.completions.create(
-                    model=deployment_name,
+                    model=settings["deployment_name"],
                     messages=messages_for_api,
                 )
+                assistant_text = (response.choices[0].message.content or "").strip()
             except OpenAIError as e:
                 st.session_state.messages.pop()
-                st.error(openai_error_text(e))
+                st.error(api_error_text(e))
                 st.stop()
-
-            assistant_text = response.choices[0].message.content or ""
+            except Exception as e:
+                st.session_state.messages.pop()
+                st.error(api_error_text(e))
+                st.stop()
 
         st.session_state.messages.append({"role": "assistant", "content": assistant_text})
         st.rerun()
